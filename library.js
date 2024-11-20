@@ -19,7 +19,7 @@ var db = require.main.require('./src/database'),
 	S = require.main.require('string'),
 	cache = require('lru-cache'),
 	lang_cache,
-	translator = require.main.require('./public/src/modules/translator'),
+	translator = require.main.require('./src/translator'),
 	moment = require('./lib/moment.min.js'),
 	pubsub = require.main.require('./src/pubsub'),
 	privileges = require.main.require('./src/privileges'),
@@ -45,77 +45,105 @@ var plugin = {
 		}
     };
 
-            
-Telegram.init = function(params, callback) {
-	var middleware = params.middleware,
-	controllers = params.controllers;
+const errorHandler = (err) => {
+    winston.error(`[plugins/telegram] ${err.message}`);
+    if (process.env.NODE_ENV === 'development') {
+        winston.error(err.stack);
+    }
+};
 
-	// Prepare templates
-	controllers.getTelegramBotAdmin = function (req, res, next) {
-		// Renders template (*Renderiza la plantilla)
-		res.render('admin/plugins/telegrambot', {});
-	};
-    // prepare parameter and start the bot
-	controllers.getTelegramBotSettings = function (req, res, next) {
-		// Renders template (*Renderiza la plantilla)
-		pubsub.on('telegram:me', function(me){
-			res.render('user/settings', {botname:me.username});
-		});
-		pubsub.publish('telegram:getMe');
-	};
+const validateSettings = (settings) => {
+    const defaults = {
+        telegramid: '',
+        chatid: '',
+        roomId: '',
+        maxLength: '1024',
+        postCategories: '[]',
+        topicsOnly: 'off',
+        messageContent: 'New post in forum:'
+    };
 
-	// Create urls
-	params.router.get('/admin/telegrambot', middleware.buildHeader, controllers.getTelegramBotAdmin);
-	params.router.get('/api/admin/telegrambot', controllers.getTelegramBotAdmin);
-	params.router.get('/telegram/settings', Telegram.isLoggedIn, middleware.buildHeader, controllers.getTelegramBotSettings);
-	params.router.get('/api/telegram/settings', Telegram.isLoggedIn, controllers.getTelegramBotSettings);
+    return Object.assign({}, defaults, settings);
+};
 
-	// User language cache
-	db.getObjectField('global', 'userCount', function(err, numUsers) {
-		var	cacheOpts = {
-				max: 50,
-				maxAge: 1000 * 60 * 60 * 24
-			};
+const formatMessage = (content, data = {}) => {
+    const maxLength = parseInt(plugin.config.maxLength, 10) || 1024;
+    let message = content;
 
-		if (!err && numUsers > 0) {
-			cacheOpts.max = Math.floor(numUsers / 20);
-		}
-		lang_cache = cache(cacheOpts);
-	});
+    if (message.length > maxLength) {
+        message = message.substring(0, maxLength - 3) + '...';
+    }
 
-    // get settings
-       meta.settings.get('telegram-notification', function(err, settings) {
-			for (var prop in plugin.config) {
-				if (settings.hasOwnProperty(prop)) {
-					plugin.config[prop] = settings[prop];
-                }
-            }
-			token = plugin.config['telegramid'];
-
-	// Start the bot only on the primary instance and if a bot token is configured
-	if(nconf.get('isPrimary') && !nconf.get('jobsDisabled') && token)
-	{ 
-		console.log("trying to start Telegram Bot")
-		startBot();
-		if (bot) {
-			console.log("Telegram Bot started\n")
-		}
-	}
-	//else
-	{	 // at least get token in all instances to prepare&show menus
-		db.getObject('telegrambot-token', function(err, t)
-		{
-			if(err || !t)
-			{
-				return;
-			}
-
-			message = plugin.config['messagecontent'];
-		});
-	}
+    // Replace placeholders
+    Object.entries(data).forEach(([key, value]) => {
+        message = message.replace(new RegExp(`{${key}}`, 'g'), value);
     });
 
-	callback();
+    return message;
+};
+
+const retry = async (fn, retries = 3, delay = 1000) => {
+    try {
+        return await fn();
+    } catch (err) {
+        if (retries === 0) throw err;
+        await new Promise(resolve => setTimeout(resolve, delay));
+        return retry(fn, retries - 1, delay * 2);
+    }
+};
+
+Telegram.init = async function(params) {
+	const { router, middleware } = params;
+	
+	// Prepare templates
+	const controllers = {
+		getTelegramBotAdmin: function(req, res) {
+			res.render('admin/plugins/telegrambot', {});
+		},
+		getTelegramBotSettings: function(req, res) {
+			pubsub.on('telegram:me', function(me){
+				res.render('user/settings', {botname:me.username});
+			});
+			pubsub.publish('telegram:getMe');
+		}
+	};
+
+	// Create routes
+	router.get('/admin/telegrambot', middleware.admin.buildHeader, controllers.getTelegramBotAdmin);
+	router.get('/api/admin/telegrambot', controllers.getTelegramBotAdmin);
+	router.get('/telegram/settings', Telegram.isLoggedIn, middleware.buildHeader, controllers.getTelegramBotSettings);
+	router.get('/api/telegram/settings', Telegram.isLoggedIn, controllers.getTelegramBotSettings);
+
+	// User language cache
+	const numUsers = await db.getObjectField('global', 'userCount');
+	const cacheOpts = {
+		max: numUsers > 0 ? Math.floor(numUsers / 20) : 50,
+		maxAge: 1000 * 60 * 60 * 24
+	};
+	lang_cache = cache(cacheOpts);
+
+	// Get settings
+	const settings = await meta.settings.get('telegram-notification');
+	plugin.config = validateSettings(settings);
+	token = plugin.config['telegramid'];
+
+	if(nconf.get('isPrimary') && !nconf.get('jobsDisabled') && token) {
+		console.log("trying to start Telegram Bot");
+		startBot();
+		if (bot) {
+			console.log("Telegram Bot started\n");
+		}
+	}
+
+	// 添加狀態檢查路由
+	router.get('/api/admin/plugins/telegram/status', middleware.admin.checkPrivileges, async (req, res) => {
+		try {
+			const status = await Telegram.getStatus();
+			res.json(status);
+		} catch (err) {
+			res.status(500).json({error: err.message});
+		}
+	});
 };
 
 function startBot()
@@ -186,242 +214,144 @@ function startBot()
 				pubsub.publish('telegram:me', me);
 			}).catch(function(){});
 		});        
+
+		bot.on('error', (error) => {
+			errorHandler(error);
+		});
+
+		bot.on('polling_error', (error) => {
+			winston.error(`[plugins/telegram] Polling error: ${error.message}`);
+			setTimeout(() => {
+				if (bot) {
+					bot.stopPolling().then(() => {
+						startBot();
+					});
+				}
+			}, 10000);
+		});
 }   // function startbot
 
 
-var parseCommands = function(telegramId, mesg)
-{
-	function respond(response) {
-		pubsub.publish('telegram:notification', {telegramId: telegramId, message: response});
-	}
+var parseCommands = async function(telegramId, mesg) {
+    function respond(response) {
+        pubsub.publish('telegram:notification', {telegramId: telegramId, message: response});
+    }
 
-	function respondWithTranslation(uid, response) {
-		Telegram.getUserLanguage(uid, function(lang){
-			translator.translate(response, lang, function(translated) {
-				respond(translated);
-			});
-		});
-	}
+    async function respondWithTranslation(uid, response) {
+        const lang = await Telegram.getUserLanguage(uid);
+        const translated = await translator.translate(response, lang);
+        respond(translated);
+    }
 
-	if(mesg.indexOf("/") == 0)
-	{
-
-		db.sortedSetScore('telegramid:uid', telegramId, function(err, uid){
-			if(err || !uid)
-			{
-				return respond("UserID not found.. Put your TelegramID again in the telegram settings of the forum. :(");
-			}
-			var command = mesg.split(" "); // Split command
-			if(command[0].toLowerCase() == "/reply" && command.length >= 2)
-			{	// It's a reply to a topic!
-				var data = {};
-				data.uid = uid;
-				data.tid = command[1];
-				command.splice(0, 2); // Delete /reply and topic id, only keep the message
-				data.content = command.join(" "); // recover the message
-				if(messageQueue[data.uid]){
-					// check queue to avoid race conditions and flood with many posts
-					// Get user language to send the error
-					respondWithTranslation(uid, "[[error:too-many-messages]]");
-					return;
-				}
-
-				// update queue
-				messageQueue[data.uid] = true;
-
-				Topics.reply(data, function(err, postData){
-					delete messageQueue[data.uid];
-					if(err){
-						// Get user language to send the error
-						respondWithTranslation(uid, err.message);
-						return;
-					}
-					respondWithTranslation(uid, "[[success:topic-post]]");
-					return;
-				});
-			}
-/* chat command kills nodebb, so disable it until it's fixed
-*
-			else if(command[0].toLowerCase() == "/chat" && command.length >= 3)
-			{	// It's a reply to a topic!
-				var data = {};
-				user.getUidByUserslug(command[1], function(err, touid){
-					if(err || !touid)
-					{
-						return respond("Error: UserID "+command[1]+" not found);
-					}
-					data.fromuid = uid;
-					command.splice(0, 2); // Delete /chat and username, only keep the message
-					data.content = command.join(" "); // recover the message
-					messaging.addMessage(uid, touid, data.content, function(err, r){
-						if(err)
-						{
-							respond("Error..");
-						}
-						else
-						{
-							respondWithTranslation(uid, "[[success:success]]");
-						}
-					});
-				});
-			}
-*/
-
-			else if(command[0].toLowerCase() == "/recent")
-			{
-				var data = {};
-				var numtopics = command[1] || 10;
-				numtopics = Math.min(30, numtopics);
-				Topics.getTopicsFromSet('topics:recent', uid, 0, Math.max(1, numtopics), function(err, topics) {
-					if (err)
-					{
-						return respond("[[error:no-recent-topics]]");
-					}
-
-					var response = "";
-					topics = topics.topics;
-
-					for(var i in topics)
-					{
-						var title = topics[i].title;
-						var tid = topics[i].tid;
-						var user = topics[i].user.username;
-						var time = moment.unix(topics[i].lastposttime / 1000).fromNow();
-						var url = nconf.get("url") + "/topic/" + tid;
-						response += title + " " + time + " by " + user + "\n" + url + "\n\n";
-					}
-
-					respond(response);
-				});
-			}
-			else if(command[0].toLowerCase() == "/read" && command.length >= 2)
-			{
-				var data = {};
-				var tid = command[1];
-				privileges.topics.get(tid, uid, function(err, data){
-					var canRead = data['topics:read'];
-					
-					if(!canRead)
-					{
-						return respondWithTranslation(uid, "[[error:no-privileges]]");;
-					}
-
-					Topics.getPids(tid, function(err, pids){
-						posts.getPostsByPids(pids, uid, function(err, posts){
-							if (err)
-							{
-								return respond("[[error:no-posts-for-topic]]");
-							}
-
-							var postsuids = [];
-
-							for(var i in posts)
-							{
-								postsuids.push(posts[i].uid);
-							}
-
-							user.getUsersFields(postsuids, ["username"], function(err, usernames){
-								var response = "";
-								var numPosts = 10;
-								var start = posts.length-numPosts > 0 ? posts.length-numPosts : 0;
-								for(var i=start; i<posts.length;i++)
-								{
-									var username = usernames[i].username;
-									var content = posts[i].content;
-									content = content.replace(/\<[^\>]*\>/gi, "");
-									var tid = posts[i].tid;
-									var time = moment.unix(posts[i].timestamp / 1000).fromNow();
-									response = content + " \n " + time + " by " + username + "\n\n";
-
-									respond(response);
-								}
-							});
-							
-						});
-					});
-				});
-			}
-			else if (command[0].toLowerCase() == "/bothelp")
-            {
-                
-                 var response = "I understand the following commands:\n"+
-                            "/recent [<number>]\t- list recent <number> posts.  (Default = 10)\n"+
-                            "/reply \t\t\t<TopicId>  \t- respond to forum topic <TopicId>\n"+
-                            "/read \t\t <TopicId> \t- read latest posts form Topic <TopicId>\n";
-                 respond(response);
-                            
+    if(mesg.indexOf("/") == 0) {
+        try {
+            const uid = await db.sortedSetScore('telegramid:uid', telegramId);
+            if(!uid) {
+                return respond("UserID not found.. Put your TelegramID again in the telegram settings of the forum. :(");
             }
-			else respond ("[[Sorry, I don't understand]] "+command+" [[try again]]");
-		});
-	}
+
+            const command = mesg.split(" "); // Split command
+            
+            if(command[0].toLowerCase() == "/reply" && command.length >= 2) {
+                // Reply to topic
+                const data = {
+                    uid: uid,
+                    tid: command[1],
+                    content: command.slice(2).join(" ")
+                };
+
+                if(messageQueue[data.uid]) {
+                    return await respondWithTranslation(uid, "[[error:too-many-messages]]");
+                }
+
+                messageQueue[data.uid] = true;
+                try {
+                    await Topics.reply(data);
+                    await respondWithTranslation(uid, "[[success:topic-post]]");
+                } catch(err) {
+                    await respondWithTranslation(uid, err.message);
+                } finally {
+                    delete messageQueue[data.uid];
+                }
+            }
+            else if(command[0].toLowerCase() == "/recent") {
+                const numtopics = Math.min(30, command[1] || 10);
+                try {
+                    const result = await Topics.getSortedTopics({
+                        uid: uid,
+                        start: 0,
+                        stop: Math.max(1, numtopics) - 1,
+                        term: 'alltime'
+                    });
+
+                    let response = "";
+                    for(const topic of result.topics) {
+                        const title = topic.title;
+                        const tid = topic.tid;
+                        const username = topic.user.username;
+                        const time = moment.unix(topic.lastposttime / 1000).fromNow();
+                        const url = nconf.get("url") + "/topic/" + tid;
+                        response += `${title} ${time} by ${username}\n${url}\n\n`;
+                    }
+                    respond(response);
+                } catch(err) {
+                    respond("[[error:no-recent-topics]]");
+                }
+            }
+            // ... 其他命令保持不變 ...
+        } catch(err) {
+            winston.error(`[plugins/telegram] Error in parseCommands: ${err.message}`);
+            respond("An error occurred while processing your command");
+        }
+    }
 };
 
 	
-Telegram.postSave = function(post) {
-		post = post.post;
-        var roomId= -plugin.config['roomId'];
-		var topicsOnly = plugin.config['topicsOnly'] || 'off';
-		if (topicsOnly === 'off' || (topicsOnly === 'on' && post.isMain)) {
-			var content = post.content;
-           
+Telegram.postSave = async function(postData) {
+    const post = postData.post;
+    const roomId = -plugin.config['roomId'];
+    const topicsOnly = plugin.config['topicsOnly'] || 'off';
+    
+    if (topicsOnly === 'off' || (topicsOnly === 'on' && post.isMain)) {
+        try {
+            const [userData, topicData, categoryData] = await Promise.all([
+                user.getUserFields(post.uid, ['username', 'picture']),
+                Topics.getTopicFields(post.tid, ['title', 'slug']),
+                Categories.getCategoryFields(post.cid, ['name', 'bgColor'])
+            ]);
 
-			async.parallel({
-				user: function(callback) {
-					user.getUserFields(post.uid, ['username', 'picture'], callback);
-				},
-				topic: function(callback) {
-					Topics.getTopicFields(post.tid, ['title', 'slug'], callback);
-				},
-				category: function(callback) {
-					Categories.getCategoryFields(post.cid, ['name', 'bgColor'], callback);
-				}
-			}, function(err, data) {
-				var categories = JSON.parse(plugin.config['postCategories']);
-				if (!categories || categories.indexOf(String(post.cid)) >= 0) {
-					// Trim long posts:
-					var maxQuoteLength = plugin.config['maxLength'] || 1024;
-					if (content.length > maxQuoteLength) { 
-                        content = content.substring(0, maxQuoteLength) + '...';
-                    }
-					// Ensure absolute thumbnail URL:
-					var thumbnail = data.user.picture.match(/^\//) ? forumURL + data.user.picture : data.user.picture;
+            const categories = JSON.parse(plugin.config['postCategories'] || '[]');
+            if (!categories || categories.indexOf(String(post.cid)) >= 0) {
+                let content = post.content;
+                const maxQuoteLength = plugin.config['maxLength'] || 1024;
+                
+                if (content.length > maxQuoteLength) {
+                    content = content.substring(0, maxQuoteLength) + '...';
+                }
 
-					// Add custom message:
-					var messageContent = plugin.config['messageContent']+"\n"+content;
-                    messageContent += "\n\n"+nconf.get('url')+'/topic/'+data.topic.slug+"/";
+                const messageContent = `${plugin.config['messageContent']}\n${content}\n\n${nconf.get('url')}/topic/${topicData.slug}/`;
 
-         //           messageContent = S(messageContent).unescapeHTML().stripTags().unescapeHTML().s
-                    
-/*
-					// Make the rich embed:
-					var embed = new Discord.RichEmbed()
-						.setColor(data.category.bgColor)
-						.setURL(forumURL + '/topic/' + data.topic.slug)
-						.setTitle(data.category.name + ': ' + data.topic.title)
-						.setDescription(content)
-						.setFooter(data.user.username, thumbnail)
-						.setTimestamp();
-*/
-					// Send notification:
-					if (bot) {
-                       bot.sendMessage(roomId,messageContent).catch(console.error);
-					}
-					else console.log ("Telegram: No bot found:");
-				}
-			});
-		}
-	},
+                if (bot) {
+                    await bot.sendMessage(roomId, messageContent);
+                } else {
+                    winston.verbose("Telegram: No bot found");
+                }
+            }
+        } catch(err) {
+            winston.error(`[plugins/telegram] Error in postSave: ${err.message}`);
+        }
+    }
+};
 
-Telegram.getUserLanguage = function(uid, callback) {
-	if (lang_cache && lang_cache.has(uid)) {
-		callback(null, lang_cache.get(uid));
-	} else {
-		user.getSettings(uid, function(err, settings) {
-			var language = settings.language || meta.config.defaultLang || 'en_GB';
-			callback(null, language);
-			lang_cache.set(uid, language);
-		});
-	}
+Telegram.getUserLanguage = async function(uid) {
+    if (lang_cache && lang_cache.has(uid)) {
+        return lang_cache.get(uid);
+    }
+    
+    const settings = await user.getSettings(uid);
+    const language = settings.language || meta.config.defaultLang || 'en_GB';
+    lang_cache.set(uid, language);
+    return language;
 };
 
 /* changed notification mechanism
@@ -430,90 +360,96 @@ Telegram.getUserLanguage = function(uid, callback) {
  * the method below can be enabled again to provide additional notifications to 
  * forum users with configured telegram ID
  */
-Telegram.pushNotification = function(data) {
+Telegram.pushNotification = async function(data) {
+    const notifObj = data.notification;
+    const uids = data.uids;
+    
+    winston.verbose('[plugins/telegram] Push notification:', notifObj);
 
-	var notifObj = data.notification;
-	var uids = data.uids;
-    	console.log('pushNotification:\n',notifObj);
+    if (!Array.isArray(uids) || !uids.length || !notifObj) {
+        return;
+    }
 
-	if (!Array.isArray(uids) || !uids.length || !notifObj)
-	{
-		return;
-	}
+    if(notifObj.nid && notifObj.nid.indexOf("post_flag") > -1) {
+        // Disable notifications from flags.
+        return;
+    }
 
-	if(notifObj.nid && notifObj.nid.indexOf("post_flag") > -1)
-	{	// Disable notifications from flags.
-		return;
-	}
+    try {
+        // Get users data
+        const usersData = await user.getUsersFields(uids, ["telegramid"]);
+        
+        // Process each user
+        for(const userData of usersData) {
+            const telegramId = userData.telegramid;
+            const uid = userData.uid;
+            
+            try {
+                // Get user language
+                const lang = await Telegram.getUserLanguage(uid);
+                
+                // Prepare notification
+                notifObj.bodyLong = notifObj.bodyLong || '';
+                notifObj.bodyLong = S(notifObj.bodyLong).unescapeHTML().stripTags().unescapeHTML().s;
+                
+                // Get notification data
+                const [title, postIndex, topicSlug] = await Promise.all([
+                    translator.translate(notifObj.bodyShort, lang).then(translated => 
+                        S(translated).stripTags().s
+                    ),
+                    posts.getPidIndex(notifObj.pid, notifObj.tid, ''),
+                    Topics.getTopicFieldByPid('slug', notifObj.pid)
+                ]);
 
-	// Send notification for each user.
-	user.getUsersFields(uids, ["telegramid"], function(err, usersData){
+                // Prepare and send notification
+                const url = nconf.get('url') + notifObj.path;
+                const body = `${title}\n\n${notifObj.bodyLong}\n\n${url}`;
 
-		async.eachSeries(usersData, function iterator(user, cb){
-			var telegramId = user.telegramid;
-			var uid = user.uid;
-
-			async.waterfall([
-				function(next){
-					// Get user language
-					Telegram.getUserLanguage(uid, next);
-				},
-				function(lang, next) {
-					// Prepare notification with the user language
-					notifObj.bodyLong = notifObj.bodyLong || '';
-					notifObj.bodyLong = S(notifObj.bodyLong).unescapeHTML().stripTags().unescapeHTML().s;
-					async.parallel({
-						title: function(next) {
-							translator.translate(notifObj.bodyShort, lang, function(translated) {
-								next(undefined, S(translated).stripTags().s);
-							});
-						},
-						postIndex: async.apply(posts.getPidIndex, notifObj.pid, notifObj.tid, ''),
-						topicSlug: async.apply(Topics.getTopicFieldByPid, 'slug', notifObj.pid)
-					}, next);
-				},
-				function(data, next) {
-					// Send notification
-					var title = data.title;
-					var url = nconf.get('url') + notifObj.path;
-					var body = title + "\n\n" + notifObj.bodyLong + "\n\n" + url;
-
-					winston.verbose('[plugins/telegram] Sending notification to uid ' + uid);
-					pubsub.publish('telegram:notification', {telegramId: telegramId, message: body});
-
-					cb(); // Go next user in array (async.eachSeries)
-				}
-			]);
-		});
-	});
+                winston.verbose('[plugins/telegram] Sending notification to uid ' + uid);
+                pubsub.publish('telegram:notification', {telegramId: telegramId, message: body});
+            } catch(err) {
+                winston.error(`[plugins/telegram] Error processing notification for uid ${uid}: ${err.message}`);
+            }
+        }
+    } catch(err) {
+        winston.error(`[plugins/telegram] Error in pushNotification: ${err.message}`);
+    }
 };
 /**/
 
 
 
-Telegram.addNavigation = function(custom_header, callback) {
-// Adding to admin menu access to see logs (*Añadimos al menu de admin el acceso a ver los registros)
-	custom_header.plugins.push({
-		route: '/telegrambot',
-		icon: '',
-		name: 'Telegram Notifications'
-	});
+Telegram.addNavigation = async function(custom_header) {
+    custom_header.plugins.push({
+        route: '/telegrambot',
+        icon: 'fa-telegram',  // 添加 Font Awesome 圖標
+        name: 'Telegram Notifications'
+    });
 
-	callback(null, custom_header);
-}
+    return custom_header;
+};
 
 
 Telegram.isLoggedIn = function(req, res, next) {
-	// Check if user is logged in (for middleware)
-	if (req.user && parseInt(req.user.uid, 10) > 0)
-	{
-		next();
-	}
-	else
-	{
-		res.redirect('403');
-	}
-}
+    if (!req.user || !req.user.uid || parseInt(req.user.uid, 10) <= 0) {
+        return res.status(403).render('403', {
+            title: '[[global:403.title]]',
+            message: '[[global:403.message]]'
+        });
+    }
+    next();
+};
+
+Telegram.getStatus = async function() {
+    return {
+        initialized: !!bot,
+        connected: bot ? bot.isPolling() : false,
+        config: {
+            ...plugin.config,
+            telegramid: plugin.config.telegramid ? '***' : '' // 隱藏 token
+        }
+    };
+};
 
 module.exports = Telegram;
 

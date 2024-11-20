@@ -10,10 +10,14 @@
 		{ "hook": "action:post.save", "method": "postSave"},
         { "hook": "action:user.saveSettings", "method": "saveUserSettings"},
 		{ "hook": "filter:user.profileMenu", "method": "addProfileItem" },
-		{ "hook": "filter:admin.header.build", "method": "addNavigation", "callbacked": true },
+		{ "hook": "filter:admin.header.build", "method": "addNavigation" },
 		{ "hook": "filter:user.customSettings", "method": "addUserSettings"},
 		{ "hook": "filter:user.getSettings", "method": "getUserSettings"}
 ],
+	"staticDirs": {
+		"static": "./static"
+	},
 	"templates": "static/templates",
-	"languages": "./languages"
+	"languages": "languages",
+	"minNodeBBVersion": "3.0.0"
 }
